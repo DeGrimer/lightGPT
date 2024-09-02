@@ -35,7 +35,8 @@ class CasualSelfAttention(nn.Module):
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         # att = F.softmax(att, dim=-1)
         # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+            y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
 
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -197,7 +198,6 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 # -----------------------------------------------------------------------------
-# attempt to autodetect the device
 import time
 from tokenizers import Tokenizer
 from tokenizers.pre_tokenizers import PreTokenizer
@@ -213,6 +213,7 @@ class DataLoaderLite:
 
         with open('E:\\lurk\output.txt', 'r', encoding="utf-8") as f:
             text = f.read()
+        text = text[:900000]
         tokens = tokenizer.encode(text).ids
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
@@ -236,7 +237,7 @@ if torch.cuda.is_available():
 print(f"using device: {device}")
 
 
-total_batch_size = 65536 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 16384
 B = 16 # micro batch size
 T = 256 # sequence length
 assert total_batch_size % (B * T) == 0
@@ -245,13 +246,13 @@ train_loader = DataLoaderLite(B=B,T=T)
 grad_accum_steps = total_batch_size // (B * T)
 print(f"total batch size {total_batch_size}")
 print(f"calculated gradient accum step {grad_accum_steps}")
-# torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig(vocab_size=50304))
 print("Model created")
 model.to(device)
 log_file = "log.txt"
-max_lr = 6e-4
+max_lr = 5e-3
 min_lr = max_lr * 0.1
 warmup_steps = 100
 max_steps = 1017
@@ -313,8 +314,8 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
@@ -328,7 +329,8 @@ for step in range(max_steps):
     print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     with open(log_file, "a") as f:
         f.write(f"{step} train {loss_accum.item():.6f}\n")
-
+with open(log_file, "a") as f:
+    f.write(f"End of training\n")
 import sys; sys.exit(0)
 
 
