@@ -149,14 +149,27 @@ class GPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
+
+
 # -----------------------------------------------------------------------------
 import time
 from tokenizers import Tokenizer
 from tokenizers.pre_tokenizers import PreTokenizer
 from tokenize_With_Tokenizer import RusTokPreTokenizer
 import numpy as np
+
+
+def load_model(path):
+    checkpoint = torch.load(path)
+    model = GPT(checkpoint["config"])
+    model.load_state_dict(checkpoint["model"])
+    print(checkpoint["val_loss"])
+    return model
+
+
 tokenizer = Tokenizer.from_file("tokenizer-wiki50k.json")
 tokenizer.pre_tokenizer = PreTokenizer.custom(RusTokPreTokenizer())
+
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -206,131 +219,165 @@ if torch.cuda.is_available():
     device = "cuda"
 print(f"using device: {device}")
 
+def train():
+    total_batch_size = 131072
+    B = 16 # micro batch size
+    T = 256 # sequence length
+    assert total_batch_size % (B * T) == 0
+    # get a data batch
+    train_loader = DataLoaderLite(B=B,T=T, split='train')
+    val_loader = DataLoaderLite(B=B, T=T, split="val")
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total batch size {total_batch_size}")
+    print(f"calculated gradient accum step {grad_accum_steps}")
+    torch.set_float32_matmul_precision('high')
+    # get logits
+    model = GPT(GPTConfig(vocab_size=50304))
+    print("Model created")
+    model.to(device)
+    max_lr = 9e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 50
+    max_steps = 1001
+    def get_lr(it):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_steps:
+            return max_lr * (it+1) / warmup_steps
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > max_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (max_lr - min_lr)
 
-total_batch_size = 131072
-B = 16 # micro batch size
-T = 256 # sequence length
-assert total_batch_size % (B * T) == 0
-# get a data batch
-train_loader = DataLoaderLite(B=B,T=T, split='train')
-val_loader = DataLoaderLite(B=B, T=T, split="val")
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total batch size {total_batch_size}")
-print(f"calculated gradient accum step {grad_accum_steps}")
-torch.set_float32_matmul_precision('high')
-# get logits
-model = GPT(GPTConfig(vocab_size=50304))
-print("Model created")
-model.to(device)
-max_lr = 9e-4
-min_lr = max_lr * 0.1
-warmup_steps = 50
-max_steps = 1001
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
 
+    # model = torch.compile(model) don't work cause triton lib i think
+    # optimize!
 
-# model = torch.compile(model) don't work cause triton lib i think
-# optimize!
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log.txt")
 
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=9e-4, device=device)
+    for step in range(max_steps):
+        t0 = time.time()
+        last_step = (step == max_steps - 1)
 
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=9e-4, device=device)
-for step in range(max_steps):
-    t0 = time.time()
-    last_step = (step == max_steps - 1)
-
-    if (step > 0 and step % 100 == 0):
-        model.eval()
-        num_return_sequences = 4
-        max_length = 100
-        tokens = tokenizer.encode("При коммунизме все будет заебись, все будет бесплатно, все будет в кайф ").ids
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
+        if (step > 0 and step % 100 == 0):
+            model.eval()
+            num_return_sequences = 4
+            max_length = 100
+            tokens = tokenizer.encode("При коммунизме все будет заебись, все будет бесплатно, все будет в кайф ").ids
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            while xgen.size(1) < max_length:
+                # forward the model to get the logits
+                with torch.no_grad():
+                    logits, loss = model(xgen) # (B, T, vocab_size)
+                    # take the logits at the last position
+                    logits = logits[:, -1, :] # (B, vocab_size)
+                    # get the probabilities
+                    probs = F.softmax(logits, dim=-1)
+                    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                    # select a token from the top-k probabilities
+                    # note: multinomial does not demand the input to sum to 1
+                    ix = torch.multinomial(topk_probs, 1) # (B, 1)
+                    # gather the corresponding indices
+                    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                    # append to the sequence
+                    xgen = torch.cat((xgen, xcol), dim=1)
+            # print the generated text
+            for i in range(num_return_sequences):
+                tokens = xgen[i, :max_length].tolist()
+                decoded = tokenizer.decode(tokens)
+                print(f" sample {i}: {decoded}")
+        if step % 100 == 0 or last_step:
+            model.eval()
+            val_loader.reset()
             with torch.no_grad():
-                logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
-                ix = torch.multinomial(topk_probs, 1) # (B, 1)
-                # gather the corresponding indices
-                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
-                xgen = torch.cat((xgen, xcol), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = tokenizer.decode(tokens)
-            print(f" sample {i}: {decoded}")
-    if step % 100 == 0 or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        print(f"validation loss: {val_loss_accum.item():.4f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-        if step > 0 and (step % 500 == 0 or last_step):
-            # optionally write model checkpoints
-            checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-            checkpoint = {
-                'model': model.state_dict(),
-                'config': model.config,
-                'step': step,
-                'val_loss': val_loss_accum.item()
-            }
-            # you might also want to add optimizer.state_dict() and
-            # rng seeds etc., if you wanted to more exactly resume training
-            torch.save(checkpoint, checkpoint_path)
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 500 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'config': model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # To load model use method "load_model"
+                torch.save(checkpoint, checkpoint_path)
 
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        model.train()
+        optimizer.zero_grad()
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        t1 = time.time()
+        dt = (t1 - t0)*1000 # time difference in miliseconds
+        tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
     with open(log_file, "a") as f:
-        f.write(f"{step} train {loss_accum.item():.6f}\n")
-with open(log_file, "a") as f:
-    f.write(f"End of training\n")
+        f.write(f"End of training\n")
+
+def generate():
+    model = load_model("log/model_01000.pt")
+    model.to(device)
+    model.eval()
+    num_return_sequences = 4
+    max_length = 100
+    tokens = tokenizer.encode("Телеграм это мессенджер ").ids
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    xgen = tokens.to(device)
+    while xgen.size(1) < max_length:
+        # forward the model to get the logits
+        with torch.no_grad():
+            logits, loss = model(xgen) # (B, T, vocab_size)
+            # take the logits at the last position
+            logits = logits[:, -1, :] # (B, vocab_size)
+            # get the probabilities
+            probs = F.softmax(logits, dim=-1)
+            # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            # select a token from the top-k probabilities
+            # note: multinomial does not demand the input to sum to 1
+            ix = torch.multinomial(topk_probs, 1) # (B, 1)
+            # gather the corresponding indices
+            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            # append to the sequence
+            xgen = torch.cat((xgen, xcol), dim=1)
+    # print the generated text
+    for i in range(num_return_sequences):
+        tokens = xgen[i, :max_length].tolist()
+        decoded = tokenizer.decode(tokens)
+        print(f" sample {i}: {decoded}")
+if __name__ == "__main__":
+    generate() 
