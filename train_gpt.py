@@ -80,6 +80,13 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
 
+@dataclass
+class Hyperparameters:
+    max_lr: int = 9e-4
+    min_lr: int = max_lr * 0.1
+    warmup_steps: int = 50
+    max_steps: int = 1001
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -219,7 +226,7 @@ if torch.cuda.is_available():
     device = "cuda"
 print(f"using device: {device}")
 
-def train():
+def train(hyperparams):
     total_batch_size = 131072
     B = 16 # micro batch size
     T = 256 # sequence length
@@ -235,10 +242,10 @@ def train():
     model = GPT(GPTConfig(vocab_size=50304))
     print("Model created")
     model.to(device)
-    max_lr = 9e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 50
-    max_steps = 1001
+    max_lr = hyperparams.max_lr
+    min_lr = hyperparams.min_lr
+    warmup_steps = hyperparams.warmup_steps
+    max_steps = hyperparams.max_steps
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_steps:
@@ -269,7 +276,7 @@ def train():
             model.eval()
             num_return_sequences = 4
             max_length = 100
-            tokens = tokenizer.encode("При коммунизме все будет заебись, все будет бесплатно, все будет в кайф ").ids
+            tokens = tokenizer.encode("В социальных сетях пропагандируется ").ids
             tokens = torch.tensor(tokens, dtype=torch.long)
             tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
             xgen = tokens.to(device)
@@ -318,7 +325,8 @@ def train():
                     'model': model.state_dict(),
                     'config': model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum.item(),
+                    'optimizer': optimizer.state_dict(),
                 }
                 # To load model use method "load_model"
                 torch.save(checkpoint, checkpoint_path)
@@ -380,4 +388,5 @@ def generate():
         decoded = tokenizer.decode(tokens)
         print(f" sample {i}: {decoded}")
 if __name__ == "__main__":
-    generate() 
+    hyperparams = Hyperparameters(max_steps=2001)
+    train(hyperparams)
