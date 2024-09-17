@@ -11,9 +11,10 @@ class CasualSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd)
+        self.value = nn.Identity()
+        # self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Identity()
 
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
@@ -22,22 +23,41 @@ class CasualSelfAttention(nn.Module):
 
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                                            .view(1,1, config.block_size, config.block_size))
+        self.alpha = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.beta = nn.Parameter(torch.tensor(0.0), requires_grad = True)
+        self.gamma = nn.Parameter(torch.tensor(0.0), requires_grad = True)
+        uniform_causal_attn_mat = torch.ones(
+            (config.n_embd, config.n_embd), dtype=torch.float32
+        ) / torch.arange(1, config.n_embd + 1).view(-1, 1)
+        self.register_buffer(
+            "C1",
+            torch.tril(
+                uniform_causal_attn_mat,
+            ).view(1, 1, config.n_embd, config.n_embd),
+            persistent=False,
+        )
+        self.register_buffer(
+            "diag",
+            torch.eye(config.n_embd).view(1, 1, config.n_embd, config.n_embd),
+            persistent=False,
+        )
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        qk = self.c_attn(x)
+        q, k = qk.split(self.n_embd, dim=2)
+        v = self.value(x)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
 
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
-            y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+        #     y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
 
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -242,6 +262,7 @@ def train(hyperparams):
     model = GPT(GPTConfig(vocab_size=50304))
     print("Model created")
     model.to(device)
+    print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
     max_lr = hyperparams.max_lr
     min_lr = hyperparams.min_lr
     warmup_steps = hyperparams.warmup_steps
