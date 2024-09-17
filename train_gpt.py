@@ -6,8 +6,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 import os
 
-
 class CasualSelfAttention(nn.Module):
+    '''
+    Simplified Attention Sub-Block (SAS)
+    '''
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -52,18 +54,25 @@ class CasualSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        # with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # att = self.alpha * self.diag[:,:,:T,:T] + self.beta * att - self.gamma * self.C1[:,:,:T,:T] # Shaped attention
+        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = torch.softmax(att, dim=-1)
+            att = self.alpha * self.diag[:,:,:T,:T] + self.beta * att - self.gamma * self.C1[:,:,:T,:T] # Shaped attention
+            y = att @ v
         #     y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
 
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
-        return y 
+        return y
 
 class MLP(nn.Module):
     def __init__(self, config):
