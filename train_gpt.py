@@ -13,59 +13,58 @@ class CasualSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd)
-        self.value = nn.Identity()
+        self.q = nn.Linear(config.n_embd, config.n_embd)
+        self.q.ZERO_INIT_FACTOR = 1 # Wq = 0
+        self.k = nn.Linear(config.n_embd, config.n_embd)
+        self.v = nn.Identity() # Wv = I
+        # self.v = nn.Linear(config.n_embd, config.n_embd)
+        # self.v.ORTH_INIT_FACTOR = 1
         # self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj = nn.Identity()
-
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj = nn.Identity() # Wc = I
+        # self.c_proj.SCALE_INIT_FACTOR = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                                            .view(1,1, config.block_size, config.block_size))
-        self.alpha = nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        self.beta = nn.Parameter(torch.tensor(0.0), requires_grad = True)
-        self.gamma = nn.Parameter(torch.tensor(0.0), requires_grad = True)
+        self.alpha = nn.Parameter(1.0 * torch.ones((1, self.n_head, 1, 1)), requires_grad=True)
+        self.beta = nn.Parameter(0.0 * torch.ones((1, self.n_head, 1, 1)), requires_grad = True)
+        self.gamma = nn.Parameter(0.0 * torch.ones((1, self.n_head, 1, 1)), requires_grad = True)
         uniform_causal_attn_mat = torch.ones(
-            (config.n_embd, config.n_embd), dtype=torch.float32
-        ) / torch.arange(1, config.n_embd + 1).view(-1, 1)
+            (config.block_size, config.block_size), dtype=torch.float32
+        ) / torch.arange(1, config.block_size + 1).view(-1, 1)
         self.register_buffer(
             "C1",
             torch.tril(
                 uniform_causal_attn_mat,
-            ).view(1, 1, config.n_embd, config.n_embd),
+            ).view(1, 1, config.block_size, config.block_size),
             persistent=False,
         )
         self.register_buffer(
             "diag",
-            torch.eye(config.n_embd).view(1, 1, config.n_embd, config.n_embd),
+            torch.eye(config.block_size).view(1, 1, config.block_size, config.block_size),
             persistent=False,
         )
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qk = self.c_attn(x)
-        q, k = qk.split(self.n_embd, dim=2)
-        v = self.value(x)
+        q = self.q(x)
+        k = self.k(x)
+        # q, k = qk.split(self.n_embd, dim=2)
+        v = self.v(x)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
 
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # att = self.alpha * self.diag[:,:,:T,:T] + self.beta * att - self.gamma * self.C1[:,:,:T,:T] # Shaped attention
-        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = torch.softmax(att, dim=-1)
+        att = self.alpha * self.diag[:,:,:T,:T] + self.beta * att - self.gamma * self.C1[:,:,:T,:T] # shaped attention
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = torch.softmax(att, dim=-1)
-            att = self.alpha * self.diag[:,:,:T,:T] + self.beta * att - self.gamma * self.C1[:,:,:T,:T] # Shaped attention
-            y = att @ v
+        # with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION):
         #     y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
 
 
@@ -73,7 +72,6 @@ class CasualSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
-
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -81,7 +79,7 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj.SCALE_INIT_FACTOR = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -97,8 +95,8 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.mlp(self.ln_1(x)) + self.attn(self.ln_2(x)) # parallel MHA and MLP sub-blocks 
+        # x = self.mlp(x)
         return x
 
 @dataclass
@@ -111,10 +109,10 @@ class GPTConfig:
 
 @dataclass
 class Hyperparameters:
-    max_lr: int = 9e-4
-    min_lr: int = max_lr * 0.1
-    warmup_steps: int = 50
-    max_steps: int = 1001
+    max_lr: int = 5e-3
+    min_lr: int = 0
+    warmup_steps: int = 4000
+    max_steps: int = 50000
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -135,9 +133,14 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
-            if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2 * self.config.n_layer) ** -0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if hasattr(module, 'ZERO_INIT_FACTOR'):
+                torch.nn.init.zeros_(module.weight)
+            elif hasattr(module, 'ORTH_INIT_FACTOR'):
+                torch.nn.init.orthogonal_(module.weight)
+            else:
+                if hasattr(module, 'SCALE_INIT_FACTOR'):
+                    std *= (2 * self.config.n_layer) ** -0.5
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -256,7 +259,7 @@ if torch.cuda.is_available():
 print(f"using device: {device}")
 
 def train(hyperparams):
-    total_batch_size = 131072
+    total_batch_size = 16384
     B = 16 # micro batch size
     T = 256 # sequence length
     assert total_batch_size % (B * T) == 0
@@ -295,7 +298,7 @@ def train(hyperparams):
 
     log_dir = "log"
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"log.txt")
+    log_file = os.path.join(log_dir, f"logSAS.txt")
 
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=9e-4, device=device)
     for step in range(max_steps):
@@ -350,7 +353,7 @@ def train(hyperparams):
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 500 == 0 or last_step):
                 # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint_path = os.path.join(log_dir, f"modelSAS_{step:05d}.pt")
                 checkpoint = {
                     'model': model.state_dict(),
                     'config': model.config,
