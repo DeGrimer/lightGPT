@@ -6,10 +6,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import os
 
-class CasualSelfAttention(nn.Module):
-    '''
-    Simplified Attention Sub-Block (SAS)
-    '''
+class ShapedSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -17,11 +14,7 @@ class CasualSelfAttention(nn.Module):
         self.q.ZERO_INIT_FACTOR = 1 # Wq = 0
         self.k = nn.Linear(config.n_embd, config.n_embd)
         self.v = nn.Identity() # Wv = I
-        # self.v = nn.Linear(config.n_embd, config.n_embd)
-        # self.v.ORTH_INIT_FACTOR = 1
-        # self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj = nn.Identity() # Wc = I
-        # self.c_proj.SCALE_INIT_FACTOR = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -87,16 +80,15 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 class Block(nn.Module):
-
+    '''
+    Simplified Transformer Block (paper: https://arxiv.org/abs/2311.01906)
+    '''
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.attn = ShapedSelfAttention(config)
         self.mlp = MLP(config)
     def forward(self, x):
-        x = x + self.mlp(self.ln_1(x)) + self.attn(self.ln_2(x)) # parallel MHA and MLP sub-blocks 
-        # x = self.mlp(x)
+        x = self.mlp(x) + self.attn(x) # parallel MHA and MLP sub-blocks processing
         return x
 
 @dataclass
@@ -109,7 +101,7 @@ class GPTConfig:
 
 @dataclass
 class Hyperparameters:
-    max_lr: int = 5e-3
+    max_lr: int = 9e-4
     min_lr: int = 0
     warmup_steps: int = 4000
     max_steps: int = 50000
