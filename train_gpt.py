@@ -293,6 +293,7 @@ def train(hyperparams):
     log_file = os.path.join(log_dir, f"logSAS.txt")
 
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=9e-4, device=device)
+    print(max_steps)
     for step in range(max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
@@ -404,7 +405,7 @@ def generate():
             # note: multinomial does not demand the input to sum to 1
             ix = torch.multinomial(topk_probs, 1) # (B, 1)
             # gather the corresponding indices
-            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+            xcol = torch.gather(topk_indices, -1, ix) # (B, 1)r
             # append to the sequence
             xgen = torch.cat((xgen, xcol), dim=1)
     # print the generated text
@@ -413,5 +414,5 @@ def generate():
         decoded = tokenizer.decode(tokens)
         print(f" sample {i}: {decoded}")
 if __name__ == "__main__":
-    hyperparams = Hyperparameters(max_steps=2001)
+    hyperparams = Hyperparameters(max_steps=50000)
     train(hyperparams)
